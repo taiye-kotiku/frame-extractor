@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsm6 \
     libxext6 \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -22,6 +23,9 @@ COPY . .
 
 # Expose port
 EXPOSE 10000
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
 
 # Run the application
 CMD ["python", "app.py"]
