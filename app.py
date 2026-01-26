@@ -12,7 +12,7 @@ import shutil
 import threading
 import time
 from typing import Optional, Dict, Any, List
-from uuid import uuid4
+import uuid
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
@@ -689,7 +689,7 @@ def create_slideshow():
         logger.info(f"Successfully downloaded {len(image_paths)} images")
         
         # Generate video ID and output path
-        video_id = str(uuid4())
+        video_id = str(uuid.uuid4())
         output_filename = f'{video_id}.mp4'
         output_path = os.path.join(VIDEO_STORAGE_DIR, output_filename)
         
@@ -915,7 +915,222 @@ def extract_all_frames():
         if video_path and os.path.exists(video_path):
             os.unlink(video_path)
 
+@app.route('/create-video-from-images', methods=['POST'])
+def create_video_from_images():
+    """Create video from images with transitions"""
+    try:
+        data = request.get_json()
+        
+        image_urls = data.get('image_urls', [])
+        scene_duration = data.get('scene_duration', 3)
+        transition_style = data.get('transition_style', 'fade')
+        transition_duration = data.get('transition_duration', 0.5)
+        aspect_ratio = data.get('aspect_ratio', '9:16')
+        fps = data.get('fps', 30)
+        
+        if not image_urls:
+            return jsonify({'success': False, 'error': 'image_urls required'}), 400
+        
+        # Get dimensions
+        dimensions = {
+            '9:16': (1080, 1920),
+            '16:9': (1920, 1080),
+            '1:1': (1080, 1080),
+            '4:5': (1080, 1350),
+        }
+        width, height = dimensions.get(aspect_ratio, (1080, 1920))
+        
+        video_id = str(uuid.uuid4())
+        temp_dir = f'/tmp/{video_id}'
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        try:
+            # Download all images
+            local_paths = []
+            for i, url in enumerate(image_urls):
+                response = requests.get(url, timeout=30)
+                img_path = f'{temp_dir}/image_{i:03d}.png'
+                
+                # Process image to correct size
+                img = Image.open(io.BytesIO(response.content))
+                img = img.convert('RGB')
+                
+                # Resize maintaining aspect ratio and pad
+                img.thumbnail((width, height), Image.Resampling.LANCZOS)
+                
+                # Create new image with padding
+                new_img = Image.new('RGB', (width, height), (0, 0, 0))
+                paste_x = (width - img.width) // 2
+                paste_y = (height - img.height) // 2
+                new_img.paste(img, (paste_x, paste_y))
+                new_img.save(img_path)
+                local_paths.append(img_path)
+            
+            output_path = f'{temp_dir}/output.mp4'
+            
+            if transition_style == 'none' or len(local_paths) == 1:
+                # Simple concatenation
+                input_file = f'{temp_dir}/input.txt'
+                with open(input_file, 'w') as f:
+                    for p in local_paths:
+                        f.write(f"file '{p}'\n")
+                        f.write(f"duration {scene_duration}\n")
+                    f.write(f"file '{local_paths[-1]}'\n")
+                
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat', '-safe', '0',
+                    '-i', input_file,
+                    '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black',
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-r', str(fps),
+                    output_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+                
+            elif transition_style in ['fade', 'slide', 'zoom']:
+                # Build xfade filter chain
+                inputs = []
+                for p in local_paths:
+                    inputs.extend(['-loop', '1', '-t', str(scene_duration + transition_duration), '-i', p])
+                
+                # Build filter
+                filters = []
+                
+                # Scale all inputs
+                for i in range(len(local_paths)):
+                    filters.append(f'[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v{i}]')
+                
+                # Transition type
+                transition_map = {
+                    'fade': 'fade',
+                    'slide': 'slideleft',
+                    'zoom': 'fade'  # zoom is handled differently
+                }
+                xfade_type = transition_map.get(transition_style, 'fade')
+                
+                # Create xfade chain
+                if len(local_paths) == 1:
+                    filters.append('[v0]copy[outv]')
+                else:
+                    for i in range(len(local_paths) - 1):
+                        offset = scene_duration - transition_duration + (i * (scene_duration - transition_duration))
+                        output_label = 'outv' if i == len(local_paths) - 2 else f'xf{i}'
+                        
+                        if i == 0:
+                            filters.append(f'[v0][v1]xfade=transition={xfade_type}:duration={transition_duration}:offset={scene_duration - transition_duration}[{output_label}]')
+                        else:
+                            filters.append(f'[xf{i-1}][v{i+1}]xfade=transition={xfade_type}:duration={transition_duration}:offset={offset}[{output_label}]')
+                
+                filter_complex = ';'.join(filters)
+                
+                cmd = [
+                    'ffmpeg', '-y',
+                    *inputs,
+                    '-filter_complex', filter_complex,
+                    '-map', '[outv]',
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    '-r', str(fps),
+                    output_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+            
+            # Read video and encode
+            with open(output_path, 'rb') as f:
+                video_base64 = base64.b64encode(f.read()).decode('utf-8')
+            
+            total_duration = len(local_paths) * scene_duration
+            if transition_style != 'none' and len(local_paths) > 1:
+                total_duration -= (len(local_paths) - 1) * transition_duration
+            
+            return jsonify({
+                'success': True,
+                'video_base64': video_base64,
+                'video_id': video_id,
+                'duration': total_duration,
+                'frame_count': len(local_paths)
+            })
+            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+    except subprocess.CalledProcessError as e:
+        return jsonify({
+            'success': False, 
+            'error': f'FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}'
+        }), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+
+@app.route('/add-audio-to-video', methods=['POST'])
+def add_audio_to_video():
+    """Add audio track to video"""
+    try:
+        data = request.get_json()
+        
+        video_base64 = data.get('video_base64')
+        audio_url = data.get('audio_url')
+        duration = data.get('duration')
+        
+        if not video_base64 or not audio_url:
+            return jsonify({'success': False, 'error': 'video_base64 and audio_url required'}), 400
+        
+        video_id = str(uuid.uuid4())
+        temp_dir = f'/tmp/{video_id}'
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        try:
+            # Save video
+            video_path = f'{temp_dir}/video.mp4'
+            video_bytes = base64.b64decode(video_base64)
+            with open(video_path, 'wb') as f:
+                f.write(video_bytes)
+            
+            # Download audio
+            audio_response = requests.get(audio_url, timeout=30)
+            audio_path = f'{temp_dir}/audio.mp3'
+            with open(audio_path, 'wb') as f:
+                f.write(audio_response.content)
+            
+            output_path = f'{temp_dir}/output.mp4'
+            
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', audio_path,
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-shortest',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+            ]
+            
+            if duration:
+                cmd.extend(['-t', str(duration)])
+            
+            cmd.append(output_path)
+            
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            with open(output_path, 'rb') as f:
+                result_base64 = base64.b64encode(f.read()).decode('utf-8')
+            
+            return jsonify({
+                'success': True,
+                'video_base64': result_base64,
+                'has_audio': True
+            })
+            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+        
 @app.route('/extract-reel-frames', methods=['POST'])
 def extract_reel_frames():
     """Extract smart frames from Instagram Reel URL for carousel"""
@@ -1069,83 +1284,6 @@ def extract_reel_frames():
         if video_path and os.path.exists(video_path):
             os.unlink(video_path)
 
-
-@app.route('/add-audio-to-video', methods=['POST'])
-def add_audio_to_video():
-    """Add audio track to a video"""
-    temp_dir = None
-    
-    try:
-        if request.json is None:
-            return jsonify({"success": False, "error": "No JSON data"}), 400
-        
-        data = request.json
-        video_url = data.get('video_url')
-        audio_url = data.get('audio_url')
-        
-        if not video_url or not audio_url:
-            return jsonify({"success": False, "error": "video_url and audio_url required"}), 400
-        
-        temp_dir = tempfile.mkdtemp()
-        
-        # Download video
-        video_path = os.path.join(temp_dir, 'video.mp4')
-        response = requests.get(video_url, timeout=60)
-        response.raise_for_status()
-        with open(video_path, 'wb') as f:
-            f.write(response.content)
-        
-        # Download audio
-        audio_path = os.path.join(temp_dir, 'audio.mp3')
-        response = requests.get(audio_url, timeout=60)
-        response.raise_for_status()
-        with open(audio_path, 'wb') as f:
-            f.write(response.content)
-        
-        # Generate output
-        video_id = str(uuid4())
-        output_path = os.path.join(VIDEO_STORAGE_DIR, f'{video_id}.mp4')
-        
-        # Get video duration
-        probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
-        duration_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-        video_duration = float(duration_result.stdout.strip()) if duration_result.returncode == 0 else 30
-        
-        # Merge video and audio
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', audio_path,
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            '-shortest',
-            '-map', '0:v:0',
-            '-map', '1:a:0',
-            '-t', str(video_duration),
-            output_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode != 0 or not os.path.exists(output_path):
-            return jsonify({"success": False, "error": "Failed to add audio"}), 500
-        
-        base_url = request.host_url.rstrip('/')
-        video_url_out = f"{base_url}/videos/{video_id}.mp4"
-        
-        return jsonify({
-            "success": True,
-            "video_url": video_url_out,
-            "video_id": video_id,
-            "duration": round(video_duration, 2)
-        })
-        
-    except Exception as e:
-        logger.error(f"Add audio error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.errorhandler(413)
